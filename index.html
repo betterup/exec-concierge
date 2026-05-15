@@ -323,6 +323,8 @@ const S = {
   selectedExecId: null,
   // coach picker (inline, in detail header) — mode: 'change' | 'assign' | null
   coachPicker: { mode: null, loading: false, coaches: null, selectedId: '', busy: false, awaitProgramAssign: false },
+  // per-slot chemistry-call coach picker — slot: 1 | 2 | 3 | null
+  chemCoachPicker: { chemId: null, slot: null, loading: false, coaches: null, busy: false },
   // post-disconnect amber banner (cleared on next detail navigation or by user)
   disconnectWarning: false,
   // create chemistry call inline form
@@ -657,6 +659,7 @@ function execRow(exec) {
 ───────────────────────────────────────── */
 function resetTransientDetailState() {
   S.coachPicker = { mode: null, loading: false, coaches: null, selectedId: '', busy: false, awaitProgramAssign: false };
+  S.chemCoachPicker = { chemId: null, slot: null, loading: false, coaches: null, busy: false };
   S.createChem = { open: false, loading: false, coaches: null, busy: false,
                    coach1: '', coach2: '', coach3: '', executiveContext: '', internalNotes: '' };
   S.createProgram = { type: null, busy: false,
@@ -855,6 +858,7 @@ function renderChemStage1(exec, chem) {
                 <button class="icon-btn" data-url="${esc(c.booking)}" onclick="copyLink(this)">📋</button>
               </div>` : `<div class="warn-note">⚠ Booking link missing — check coach record in Airtable</div>`}
           ` : `<div style="color:var(--text-3);font-style:italic;font-size:13px">Not yet assigned</div>`}
+          ${renderChemCoachSwap(cid, c.num, c)}
         </div>`).join('')}
     </div>
 
@@ -931,9 +935,10 @@ function sessionCardHTML(coach, sessions, chemId) {
   return `
   <div class="session-card ${isComplete ? 'complete' : ''}">
     <div class="coach-card-label">Coach ${coach.num}</div>
-    <div class="coach-card-name" style="margin-bottom:10px">${esc(coach.name || 'Unknown')}</div>
+    <div class="coach-card-name" style="margin-bottom:6px">${esc(coach.name || 'Unknown')}</div>
+    ${renderChemCoachSwap(chemId, coach.num, coach)}
 
-    <div class="field-group" style="margin-bottom:8px">
+    <div class="field-group" style="margin-top:10px;margin-bottom:8px">
       <label>Status</label>
       ${sessExists ? `
         <select onchange="saveSessionStatus('${sess.id}','${chemId}',this.value)">
@@ -1049,6 +1054,100 @@ function chemCoaches(chem) {
       calendly: fLu(chem,'Coach 3 Chemistry Calendly Link') || '',
       booking:  f(chem,'Booking Link Chem Coach 3') || '' },
   ];
+}
+
+/* Per-slot coach swap UI used inside Stage 1 coach cards and Stage 2 session cards. */
+function renderChemCoachSwap(chemId, slot, coach) {
+  const cp = S.chemCoachPicker;
+  const isOpen = cp.chemId === chemId && cp.slot === slot;
+  const anyBusy = cp.busy && (cp.chemId === chemId && cp.slot === slot);
+
+  if (isOpen) {
+    if (cp.loading) {
+      return `<div style="margin-top:10px;font-size:12px;color:var(--text-3)">
+        <span class="spinner spinner-sm" style="display:inline-block;vertical-align:middle;margin-right:6px"></span>Loading coaches…
+      </div>`;
+    }
+    const opts = cp.coaches || [];
+    return `
+      <div style="margin-top:10px;padding-top:10px;border-top:1px dashed var(--border)">
+        <select id="chem-coach-picker-${chemId}-${slot}" ${anyBusy ? 'disabled' : ''} style="width:100%;font-size:12px;margin-bottom:6px">
+          <option value="">— Select a coach —</option>
+          ${opts.map(c => `<option value="${esc(c.id)}" ${coach && c.id === coach.id ? 'selected' : ''}>${esc(c.name)}${c.email ? ' — ' + esc(c.email) : ''}</option>`).join('')}
+        </select>
+        <div style="display:flex;gap:6px">
+          <button class="btn btn-primary btn-sm" onclick="confirmChemCoachPicker('${chemId}',${slot})" ${anyBusy ? 'disabled' : ''}>${anyBusy ? 'Saving…' : 'Confirm'}</button>
+          <button class="btn btn-secondary btn-sm" onclick="cancelChemCoachPicker()" ${anyBusy ? 'disabled' : ''}>Cancel</button>
+        </div>
+      </div>`;
+  }
+
+  const otherPickerOpen = !!cp.chemId;
+  if (!coach || !coach.id) {
+    return `<div style="margin-top:8px">
+      <button class="btn btn-secondary btn-sm" onclick="openChemCoachPicker('${chemId}',${slot})" ${otherPickerOpen ? 'disabled' : ''}>Assign Coach</button>
+    </div>`;
+  }
+  return `<div style="margin-top:8px">
+    <button class="btn btn-secondary btn-sm" onclick="openChemCoachPicker('${chemId}',${slot})" ${otherPickerOpen ? 'disabled' : ''}>Change</button>
+  </div>`;
+}
+
+async function openChemCoachPicker(chemId, slot) {
+  S.chemCoachPicker = { chemId, slot, loading: true, coaches: null, busy: false };
+  renderDetail();
+  try {
+    const coaches = await fetchCoachesFresh();
+    S.chemCoachPicker.coaches = coaches;
+    S.chemCoachPicker.loading = false;
+    renderDetail();
+  } catch (e) {
+    showToast('Error loading coaches: ' + e.message, 'error');
+    S.chemCoachPicker = { chemId: null, slot: null, loading: false, coaches: null, busy: false };
+    renderDetail();
+  }
+}
+
+function cancelChemCoachPicker() {
+  S.chemCoachPicker = { chemId: null, slot: null, loading: false, coaches: null, busy: false };
+  renderDetail();
+}
+
+async function confirmChemCoachPicker(chemId, slot) {
+  // Read selection now — re-render will blow the DOM away.
+  const sel = document.getElementById(`chem-coach-picker-${chemId}-${slot}`);
+  const coachId = sel?.value || '';
+  if (!coachId) { showToast('Please select a coach', 'error'); return; }
+
+  const chem = S.chemCallMap[chemId];
+  if (!chem) { showToast('Chemistry Call record not found', 'error'); return; }
+  const status = f(chem, 'Status') || '';
+
+  const doSwap = async () => {
+    S.chemCoachPicker.busy = true;
+    renderDetail();
+    try {
+      const updated = await patchRec('Chemistry Calls', chemId, { [`Coach ${slot}`]: [coachId] });
+      updateChemInState(updated);
+      showToast('Coach updated.', 'success');
+      cancelChemCoachPicker();
+    } catch (e) {
+      showToast('Error: ' + e.message, 'error');
+      S.chemCoachPicker.busy = false;
+      renderDetail();
+    }
+  };
+
+  if (status === 'Coach Selected') {
+    showConfirmModal({
+      title: 'Change a coach on a Coach Selected record?',
+      message: `This chemistry call is marked <strong>Coach Selected</strong>. Are you sure you want to change Coach ${slot}? This may affect the record history.`,
+      confirmLabel: 'Proceed',
+      onConfirm: async () => { closeConfirmModal(); await doSwap(); },
+    });
+  } else {
+    await doSwap();
+  }
 }
 
 function chemNotesHTML(chem) {
@@ -1486,6 +1585,10 @@ function renderCoachPickerPanel(exec) {
 
 async function fetchCoachesFresh() {
   const recs = await fetchAll('Coaches');
+  // Sync the canonical store so coach names resolve via S.coachMap after a write,
+  // even if a coach was created in Airtable after page load.
+  S.coaches = recs;
+  buildMaps();
   return recs.map(r => ({
     id: r.id,
     name: r.fields?.['Coach Name'] || '(unnamed)',
