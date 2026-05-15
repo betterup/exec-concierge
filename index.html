@@ -843,6 +843,7 @@ function renderChemStage1(exec, chem) {
   const cid = chem.id;
   const coaches = chemCoaches(chem);
   const allLinks = coaches.every(c => !!c.booking);
+  const prepCoaches = coaches.filter(c => c.id && c.name);
 
   return `
     <div class="coach-cards">
@@ -861,6 +862,14 @@ function renderChemStage1(exec, chem) {
           ${renderChemCoachSwap(cid, c.num, c)}
         </div>`).join('')}
     </div>
+
+    ${prepCoaches.length ? `
+    <div style="margin-top:16px">
+      <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--text-2);margin-bottom:8px">Coach Prep Emails</div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        ${prepCoaches.map(c => renderPrepEmailControl(exec, chem, c)).join('')}
+      </div>
+    </div>` : ''}
 
     <div style="margin-top:14px">
       <button class="btn btn-email"
@@ -890,18 +899,6 @@ function renderChemStage2(exec, chem, sessions) {
       Kickoff email sent ${schedDate ? formatDate(schedDate) : '(date not recorded)'}
     </div>
 
-    <div style="display:flex;align-items:flex-end;gap:24px;margin-bottom:16px;flex-wrap:wrap">
-      <div class="stat">
-        <div class="stat-lbl">Calls Completed</div>
-        <div class="stat-val">${completed}<span style="font-size:15px;font-weight:400;color:var(--text-3)"> / 3</span></div>
-        <a href="${atLink}" target="_blank" rel="noopener" style="font-size:11px;color:var(--accent)">Incorrect? Adjust in Airtable ↗</a>
-      </div>
-      <div class="stat">
-        <div class="stat-lbl">Calls Booked</div>
-        <div class="stat-val">${booked}<span style="font-size:15px;font-weight:400;color:var(--text-3)"> / 3</span></div>
-      </div>
-    </div>
-
     ${needsFollowUp ? `
     <div class="callout callout-amber">
       <div class="callout-title">⚠ Follow-up may be needed</div>
@@ -929,8 +926,19 @@ function sessionCardHTML(coach, sessions, chemId) {
   const sessExists = !!sess;
   const dispStatus = statusToDisplay(sess ? f(sess,'Status') : null);
   const schedDate  = sess ? isoDate(f(sess,'Scheduled Date')) : '';
-  const isComplete = sess ? f(sess,'Status') === 'Completed' : false;
-  const noSessTip  = "No session record exists yet — this will update automatically when the executive books via Calendly. You can also log it manually by contacting Admin to create the session record.";
+
+  // Direct-path values from the Chemistry Call record (used when no Session exists).
+  const chem = S.chemCallMap[chemId];
+  const directStatus = (chem && f(chem, `Coach ${coach.num} Call Status`)) || 'Not Booked';
+  const directDate   = chem ? isoDate(f(chem, `Coach ${coach.num} Call Date`)) : '';
+
+  // Card flips to the "complete" visual when whichever path is active reports Completed.
+  const isComplete = sessExists
+    ? f(sess,'Status') === 'Completed'
+    : directStatus === 'Completed';
+
+  const statusOkId = `chem-call-status-ok-${chemId}-${coach.num}`;
+  const dateOkId   = `chem-call-date-ok-${chemId}-${coach.num}`;
 
   return `
   <div class="session-card ${isComplete ? 'complete' : ''}">
@@ -939,7 +947,7 @@ function sessionCardHTML(coach, sessions, chemId) {
     ${renderChemCoachSwap(chemId, coach.num, coach)}
 
     <div class="field-group" style="margin-top:10px;margin-bottom:8px">
-      <label>Status</label>
+      <label>Status <span id="${statusOkId}" style="color:var(--green);opacity:0;transition:opacity .2s;font-size:11px;margin-left:4px">✓</span></label>
       ${sessExists ? `
         <select onchange="saveSessionStatus('${sess.id}','${chemId}',this.value)">
           <option value="Booked"    ${dispStatus==='Booked'   ?'selected':''}>Booked</option>
@@ -947,19 +955,23 @@ function sessionCardHTML(coach, sessions, chemId) {
           <option value="Cancelled" ${dispStatus==='Cancelled'?'selected':''}>Cancelled</option>
         </select>
       ` : `
-        <select disabled title="${esc(noSessTip)}" style="color:var(--text-3)">
-          <option selected>Not Booked</option>
+        <select onchange="saveChemCallField('${chemId}','Coach ${coach.num} Call Status',this.value,'${statusOkId}')">
+          <option value="Not Booked" ${directStatus==='Not Booked'?'selected':''}>Not Booked</option>
+          <option value="Booked"     ${directStatus==='Booked'    ?'selected':''}>Booked</option>
+          <option value="Completed"  ${directStatus==='Completed' ?'selected':''}>Completed</option>
+          <option value="Cancelled"  ${directStatus==='Cancelled' ?'selected':''}>Cancelled</option>
         </select>
       `}
     </div>
 
     <div class="field-group" style="margin-bottom:0">
-      <label>Scheduled Date</label>
+      <label>Scheduled Date <span id="${dateOkId}" style="color:var(--green);opacity:0;transition:opacity .2s;font-size:11px;margin-left:4px">✓</span></label>
       ${sessExists ? `
         <input type="date" value="${schedDate}"
           onchange="saveSessionDate('${sess.id}','${chemId}',this.value)">
       ` : `
-        <input type="date" disabled style="color:var(--text-3)">
+        <input type="date" value="${directDate}"
+          onchange="saveChemCallField('${chemId}','Coach ${coach.num} Call Date',this.value||null,'${dateOkId}')">
       `}
     </div>
   </div>`;
@@ -993,9 +1005,21 @@ function renderChemStage3(exec, chem, sessions) {
 function renderChemStage4(exec, chem) {
   const cid = chem.id;
   const selectionDate = f(chem,'Selection Date');
-  const sessionSel    = S.chemCoachSelection[cid];
+  const selectedSlot  = String(f(chem,'Selected Coach Slot') || '');
+  const allCoaches    = chemCoaches(chem);
+  const selectedCoach = selectedSlot
+    ? allCoaches.find(c => String(c.num) === selectedSlot && c.id)
+    : null;
+  const notSelectedCoaches = selectedSlot
+    ? allCoaches.filter(c => c.id && c.name && String(c.num) !== selectedSlot)
+    : [];
 
-  let selectedCoachName = sessionSel?.name || '';
+  // Fallback chain for the banner: durable slot field → client-memory selection → exec.Coach.
+  let selectedCoachName = selectedCoach?.name || '';
+  if (!selectedCoachName) {
+    const sessionSel = S.chemCoachSelection[cid];
+    selectedCoachName = sessionSel?.name || '';
+  }
   if (!selectedCoachName) {
     const coachIds = fArr(exec,'Coach');
     selectedCoachName = coachIds[0] ? (S.coachMap[coachIds[0]]?.fields?.['Coach Name'] || '') : '';
@@ -1005,12 +1029,23 @@ function renderChemStage4(exec, chem) {
   const has360 = fBool(exec,'Has 360');
   const programsLinked = hasT || has360;
 
+  const postSelButtonsHTML = (selectedCoach || notSelectedCoaches.length) ? `
+    <div style="margin:14px 0 16px">
+      <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--text-2);margin-bottom:8px">Coach Follow-Up Emails</div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        ${selectedCoach ? renderChemPostSelEmailControl(exec, chem, selectedCoach, 'selected') : ''}
+        ${notSelectedCoaches.map(c => renderChemPostSelEmailControl(exec, chem, c, 'notSelected')).join('')}
+      </div>
+    </div>` : '';
+
   return `
     <div class="stage-indicator" style="border-color:var(--green-border)">
       <div class="stage-dot" style="background:var(--green)"></div>
       Coach selected${selectedCoachName ? `: <strong style="color:var(--text)">${esc(selectedCoachName)}</strong>` : ''}
       ${selectionDate ? ` on ${formatDate(selectionDate)}` : ''}
     </div>
+
+    ${postSelButtonsHTML}
 
     <div class="callout callout-gray" style="margin-bottom:14px">
       <div class="callout-title">Next step: Admin action required</div>
@@ -1148,6 +1183,55 @@ async function confirmChemCoachPicker(chemId, slot) {
   } else {
     await doSwap();
   }
+}
+
+/* Per-coach prep email control used in Stage 1. Renders either the copy button
+   or the sent-state pill with an undo link, mirroring how the kickoff button
+   flips to a "sent" state via the Scheduling Email Sent checkbox + date. */
+function renderPrepEmailControl(exec, chem, coach) {
+  const cid = chem.id;
+  const sent = fBool(chem, `Coach ${coach.num} Prep Email Sent`);
+  const sentDate = f(chem, `Coach ${coach.num} Prep Email Sent Date`);
+  if (sent) {
+    return `<div style="display:inline-flex;align-items:center;gap:8px;font-size:12px;padding:6px 10px;background:var(--green-bg);border:1px solid var(--green-border);border-radius:6px;color:var(--green)">
+      <span>✓ ${esc(coach.name)} — Sent${sentDate ? ` ${formatDate(sentDate)}` : ''}</span>
+      <a href="#" onclick="event.preventDefault();undoPrepEmail('${cid}',${coach.num})" style="color:var(--accent);font-size:11px">Undo</a>
+    </div>`;
+  }
+  return `<button class="btn btn-secondary btn-sm" onclick="copyPrepEmail('${exec.id}','${cid}',${coach.num},this)">Copy Prep Email — ${esc(coach.name)}</button>`;
+}
+
+/* Per-coach selected/not-selected email control used in Stage 4. Same pattern
+   as renderPrepEmailControl, but for a different pair of tracking fields. */
+function renderChemPostSelEmailControl(exec, chem, coach, kind) {
+  // kind: 'selected' → fields: "Selected Coach Email Sent" + Date; handler: copySelectedCoachEmail
+  // kind: 'notSelected' → fields: "Coach N Not Selected Email Sent" + Date; handler: copyNotSelectedCoachEmail
+  const cid = chem.id;
+  const isSelected = kind === 'selected';
+  const sentField = isSelected ? 'Selected Coach Email Sent' : `Coach ${coach.num} Not Selected Email Sent`;
+  const dateField = isSelected ? 'Selected Coach Email Sent Date' : `Coach ${coach.num} Not Selected Email Sent Date`;
+  const sent = fBool(chem, sentField);
+  const sentDate = f(chem, dateField);
+  const buttonLabel = isSelected
+    ? `Copy Selected Coach Email`
+    : `Copy Email — ${esc(coach.name)} (Not Selected)`;
+  const handler = isSelected
+    ? `copySelectedCoachEmail('${exec.id}','${cid}',this)`
+    : `copyNotSelectedCoachEmail('${exec.id}','${cid}',${coach.num},this)`;
+  const undoHandler = isSelected
+    ? `undoPostSelEmail('${cid}','selected',0)`
+    : `undoPostSelEmail('${cid}','notSelected',${coach.num})`;
+  const sentLabel = isSelected
+    ? `Selected coach (${esc(coach.name)}) — Sent`
+    : `${esc(coach.name)} (Not Selected) — Sent`;
+
+  if (sent) {
+    return `<div style="display:inline-flex;align-items:center;gap:8px;font-size:12px;padding:6px 10px;background:var(--green-bg);border:1px solid var(--green-border);border-radius:6px;color:var(--green)">
+      <span>✓ ${sentLabel}${sentDate ? ` ${formatDate(sentDate)}` : ''}</span>
+      <a href="#" onclick="event.preventDefault();${undoHandler}" style="color:var(--accent);font-size:11px">Undo</a>
+    </div>`;
+  }
+  return `<button class="btn ${isSelected ? 'btn-email' : 'btn-secondary'} btn-sm" onclick="${handler}">${buttonLabel}</button>`;
 }
 
 function chemNotesHTML(chem) {
@@ -1376,12 +1460,67 @@ async function saveChemField(chemId, field, value) {
 async function saveChemStatus(chemId) {
   const sel = document.getElementById(`chem-status-${chemId}`);
   if (!sel) return;
-  await saveChemField(chemId, 'Status', sel.value);
+  const value = sel.value;
+
+  try {
+    showToast('Saving…','info');
+
+    // PATCH the Status field directly so we can capture the raw Response for logging.
+    const patchResp = await fetch(`${BASE_URL}/${encodeURIComponent('Chemistry Calls')}/${chemId}`, {
+      method: 'PATCH',
+      headers: { Authorization: `Bearer ${API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ fields: { 'Status': value } }),
+    });
+    const patchBody = await patchResp.json();
+    console.log('[saveChemStatus] PATCH response', {
+      httpStatus: patchResp.status,
+      body: patchBody,
+      valueSent: value,
+    });
+    if (!patchResp.ok) {
+      throw new Error(patchBody.error?.message || `HTTP ${patchResp.status}`);
+    }
+
+    // Explicit re-fetch via GET — verifies what Airtable has stored after the write,
+    // separate from the PATCH response, so we can see if anything overwrites the value.
+    console.log('[saveChemStatus] starting re-fetch', { chemId });
+    const refetchResp = await fetch(`${BASE_URL}/${encodeURIComponent('Chemistry Calls')}/${chemId}`, {
+      headers: { Authorization: `Bearer ${API_KEY}` },
+    });
+    const refetchBody = await refetchResp.json();
+    console.log('[saveChemStatus] re-fetch complete', {
+      httpStatus: refetchResp.status,
+      statusFieldOnRecord: refetchBody?.fields?.Status,
+      fullRecord: refetchBody,
+    });
+
+    updateChemInState(refetchBody);
+    showToast('Saved','success');
+    renderDetail();
+  } catch (e) {
+    showToast('Error: ' + e.message, 'error');
+  }
 }
 
 async function saveChemNotes(chemId) {
   const notes = document.getElementById(`chem-notes-${chemId}`)?.value ?? '';
   await saveChemField(chemId,'Internal Notes',notes);
+}
+
+// Direct-path writer for per-coach Call Status / Call Date on the Chemistry Call record.
+// Used when no Session record exists; patches without re-rendering so the control keeps focus.
+async function saveChemCallField(chemId, field, value, okElId) {
+  try {
+    const updated = await patchRec('Chemistry Calls', chemId, { [field]: value });
+    updateChemInState(updated);
+    const ok = document.getElementById(okElId);
+    if (ok) {
+      ok.style.opacity = '1';
+      setTimeout(() => { ok.style.opacity = '0'; }, 1400);
+    }
+  } catch (e) {
+    showToast('Error: ' + e.message, 'error');
+  }
 }
 
 async function saveTriNotes(progId) {
@@ -1448,12 +1587,22 @@ async function confirmCoachSelection(chemId) {
   const coachId = sel?.value;
   if (!coachId) { showToast('Please select a coach','error'); return; }
   const coachName = S.coachMap[coachId]?.fields?.['Coach Name'] || 'Selected coach';
+  const chem = S.chemCallMap[chemId];
+  // Match selected coach to the slot it occupies on the chem record so we can persist Selected Coach Slot.
+  let slot = '';
+  if (chem) {
+    if (fArr(chem,'Coach 1').includes(coachId))      slot = '1';
+    else if (fArr(chem,'Coach 2').includes(coachId)) slot = '2';
+    else if (fArr(chem,'Coach 3').includes(coachId)) slot = '3';
+  }
+  if (!slot) { showToast('Selected coach does not match any slot on this Chemistry Call','error'); return; }
   const today = todayISO();
   try {
     showToast('Saving…','info');
     const updated = await patchRec('Chemistry Calls', chemId, {
       'Status': 'Coach Selected',
       'Selection Date': today,
+      'Selected Coach Slot': slot,
     });
     updateChemInState(updated);
     S.chemCoachSelection[chemId] = { name: coachName, date: today };
@@ -2059,6 +2208,10 @@ async function copyEmailA(execId, chemId, btn) {
   const coaches = chemCoaches(chem);
   const [c1,c2,c3] = coaches;
   const execName = fStr(exec,'Executive Name');
+  const execEmail = fStr(exec,'Email');
+  const eaEmail = fStr(exec,'EA Email');
+  const eaName  = fStr(exec,'EA Name');
+  const hasEA = !!eaEmail;
 
   const coachListHTML = [c1,c2,c3].map(c => {
     const name = c.name || 'Coach';
@@ -2070,10 +2223,27 @@ async function copyEmailA(execId, chemId, btn) {
     `- ${c.name||'Coach'} → ${c.booking||'[link pending]'}`
   ).join('\n');
 
+  // EA-aware branching: CC line + EA salutation + EA-specific opening.
+  const ccLineHTML = hasEA
+    ? `<p><strong>CC: ${esc(execName)}${execEmail ? ` — ${esc(execEmail)}` : ''}</strong></p>\n`
+    : '';
+  const ccLinePlain = hasEA
+    ? `CC: ${execName}${execEmail ? ` — ${execEmail}` : ''}\n\n`
+    : '';
+  const greetingName = hasEA ? (eaName || '[EA Name]') : salutation(exec);
+  const openingHTML = hasEA
+    ? `<p>We're excited to get ${esc(execName)}'s coaching journey underway! As ${esc(execName)}'s scheduling contact, the next step for you is to book three brief Chemistry Calls — one with each of the coaches we've selected as a strong fit.</p>`
+    : `<p>My name is [Your Name], and I'm the Member Concierge for BetterUp's Executive Suite program. I'll be your main point of contact as ${esc(execName)} gets started with the coaching process — so please don't hesitate to reach out to me directly at any point.</p>
+<p>The first step is scheduling three brief Chemistry Calls — one with each of the coaches we've selected as a strong fit for ${esc(execName)}. A Chemistry Call is a 15-minute introductory conversation to help ${esc(execName)} get a sense of each coach's style before making a selection. There's no agenda or preparation needed; it's simply a chance to connect.</p>`;
+  const openingPlain = hasEA
+    ? `We're excited to get ${execName}'s coaching journey underway! As ${execName}'s scheduling contact, the next step for you is to book three brief Chemistry Calls — one with each of the coaches we've selected as a strong fit.`
+    : `My name is [Your Name], and I'm the Member Concierge for BetterUp's Executive Suite program. I'll be your main point of contact as ${execName} gets started with the coaching process — so please don't hesitate to reach out to me directly at any point.
+
+The first step is scheduling three brief Chemistry Calls — one with each of the coaches we've selected as a strong fit for ${execName}. A Chemistry Call is a 15-minute introductory conversation to help ${execName} get a sense of each coach's style before making a selection. There's no agenda or preparation needed; it's simply a chance to connect.`;
+
   const html = `<p>Subject: Getting Started: Scheduling Your BetterUp Chemistry Calls</p>
-<p>Hi ${esc(salutation(exec))},</p>
-<p>My name is [Your Name], and I'm the Member Concierge for BetterUp's Executive Suite program. I'll be your main point of contact as ${esc(execName)} gets started with the coaching process — so please don't hesitate to reach out to me directly at any point.</p>
-<p>The first step is scheduling three brief Chemistry Calls — one with each of the coaches we've selected as a strong fit for ${esc(execName)}. A Chemistry Call is a 15-minute introductory conversation to help ${esc(execName)} get a sense of each coach's style before making a selection. There's no agenda or preparation needed; it's simply a chance to connect.</p>
+${ccLineHTML}<p>Hi ${esc(greetingName)},</p>
+${openingHTML}
 <p>Please use the links below to book one 15-minute call with each coach at a time that works for ${esc(execName)}:</p>
 <ul>${coachListHTML}</ul>
 <p>Each link is pre-filled with ${esc(execName)}'s information, so no additional details are needed on your end.</p>
@@ -2082,11 +2252,9 @@ async function copyEmailA(execId, chemId, btn) {
 
   const plain = `Subject: Getting Started: Scheduling Your BetterUp Chemistry Calls
 
-Hi ${salutation(exec)},
+${ccLinePlain}Hi ${greetingName},
 
-My name is [Your Name], and I'm the Member Concierge for BetterUp's Executive Suite program. I'll be your main point of contact as ${execName} gets started with the coaching process — so please don't hesitate to reach out to me directly at any point.
-
-The first step is scheduling three brief Chemistry Calls — one with each of the coaches we've selected as a strong fit for ${execName}. A Chemistry Call is a 15-minute introductory conversation to help ${execName} get a sense of each coach's style before making a selection. There's no agenda or preparation needed; it's simply a chance to connect.
+${openingPlain}
 
 Please use the links below to book one 15-minute call with each coach at a time that works for ${execName}:
 
@@ -2167,6 +2335,245 @@ Warm regards,
 BetterUp`;
 
   copyAndConfirm(html, plain, btn);
+}
+
+// Template P — Coach Prep Email (per-slot, sent in Stage 1)
+async function copyPrepEmail(execId, chemId, slot, btn) {
+  const exec = S.executives.find(e => e.id === execId);
+  const chem = S.chemCallMap[chemId];
+  if (!exec || !chem) return;
+
+  const coaches = chemCoaches(chem);
+  const coach = coaches.find(c => c.num === slot);
+  if (!coach || !coach.id) { showToast('Coach slot is empty','error'); return; }
+
+  const execName = fStr(exec,'Executive Name');
+  const orgName  = fStr(exec,'Organization / Partner');
+  const coachName = coach.name || '[Coach]';
+  const coachEmail = coach.email || '';
+  const partnerContext = fStr(exec,'Partner Context');
+  const partnerBlockHTML = partnerContext
+    ? esc(partnerContext).replace(/\n/g,'<br>')
+    : `<em>(Partner context not yet added — check with Admin before sending.)</em>`;
+  const partnerBlockPlain = partnerContext
+    ? partnerContext
+    : '(Partner context not yet added — check with Admin before sending.)';
+
+  const toLine = `To: ${coachName}${coachEmail ? ` — ${coachEmail}` : ''}`;
+  const subjectLine = `Subject: Chemistry Call Preparation — ${execName}, ${orgName}`;
+
+  const html = `<p><strong>${esc(toLine)}</strong></p>
+<p><strong>${esc(subjectLine)}</strong></p>
+<p>Hi ${esc(coachName)},</p>
+<p>You've been selected as a potential coach match for ${esc(execName)} at ${esc(orgName)}. Here's what you need to know to prepare for your Chemistry Call.</p>
+<p><strong>About this engagement</strong><br>${partnerBlockHTML}</p>
+<p><strong>What to expect in the call</strong></p>
+<ul>
+<li>No coaching is expected during this call — it's a 15-minute introductory conversation.</li>
+<li>${esc(execName)} will ask about your coaching style, approach, and how you work with senior leaders.</li>
+<li>Come prepared to speak to the engagement context above.</li>
+</ul>
+<p><strong>Calendly availability</strong><br>(Please delete whichever paragraph below does not apply to this coach.)</p>
+<p><em>If you already have a BetterUp Calendly account:</em> Please make sure your availability is current through at least the next month. ${esc(execName)}'s scheduling contact will use your Calendly link to book directly — no action needed on their end once you've updated.</p>
+<p><em>If you haven't activated your Calendly yet:</em> You should have received an activation email at your BetterUp inbox. Log in, set your availability for at least the next month, and connect your Zoom link. Once you're set up, the booking link will be shared with ${esc(execName)}'s team.</p>
+<p><strong>Compensation</strong><br>You will be compensated at your Executive coaching rate for the 15-minute chemistry call, plus 30 minutes for preparation.</p>
+<p>Thank you for your time — we're glad to have you as part of this process. Please don't hesitate to reach out with any questions.</p>
+<p>Warm regards,<br>[Your Name]<br>BetterUp</p>`;
+
+  const plain = `${toLine}
+${subjectLine}
+
+Hi ${coachName},
+
+You've been selected as a potential coach match for ${execName} at ${orgName}. Here's what you need to know to prepare for your Chemistry Call.
+
+About this engagement
+${partnerBlockPlain}
+
+What to expect in the call
+- No coaching is expected during this call — it's a 15-minute introductory conversation.
+- ${execName} will ask about your coaching style, approach, and how you work with senior leaders.
+- Come prepared to speak to the engagement context above.
+
+Calendly availability
+(Please delete whichever paragraph below does not apply to this coach.)
+
+If you already have a BetterUp Calendly account: Please make sure your availability is current through at least the next month. ${execName}'s scheduling contact will use your Calendly link to book directly — no action needed on their end once you've updated.
+
+If you haven't activated your Calendly yet: You should have received an activation email at your BetterUp inbox. Log in, set your availability for at least the next month, and connect your Zoom link. Once you're set up, the booking link will be shared with ${execName}'s team.
+
+Compensation
+You will be compensated at your Executive coaching rate for the 15-minute chemistry call, plus 30 minutes for preparation.
+
+Thank you for your time — we're glad to have you as part of this process. Please don't hesitate to reach out with any questions.
+
+Warm regards,
+[Your Name]
+BetterUp`;
+
+  const ok = await clipboardCopyRich(html, plain);
+  if (!ok) { showToast('Copy failed — please copy manually','error'); return; }
+
+  btn.textContent = '✓ Copied!';
+  btn.disabled = true;
+
+  try {
+    const today = todayISO();
+    const updated = await patchRec('Chemistry Calls', chemId, {
+      [`Coach ${slot} Prep Email Sent`]: true,
+      [`Coach ${slot} Prep Email Sent Date`]: today,
+    });
+    updateChemInState(updated);
+    showToast('Prep email copied & marked sent ✓','success');
+  } catch(e) {
+    showToast('Email copied but failed to mark sent: '+e.message,'error');
+  }
+  setTimeout(() => renderDetail(), 900);
+}
+
+async function undoPrepEmail(chemId, slot) {
+  try {
+    const updated = await patchRec('Chemistry Calls', chemId, {
+      [`Coach ${slot} Prep Email Sent`]: false,
+      [`Coach ${slot} Prep Email Sent Date`]: null,
+    });
+    updateChemInState(updated);
+    showToast('Prep email undone','success');
+    renderDetail();
+  } catch(e) { showToast('Error: '+e.message,'error'); }
+}
+
+// Template S — Selected Coach Email (Stage 4)
+async function copySelectedCoachEmail(execId, chemId, btn) {
+  const exec = S.executives.find(e => e.id === execId);
+  const chem = S.chemCallMap[chemId];
+  if (!exec || !chem) return;
+
+  const slot = String(f(chem,'Selected Coach Slot') || '');
+  const coach = chemCoaches(chem).find(c => String(c.num) === slot);
+  if (!coach || !coach.id) { showToast('Selected coach slot is not populated','error'); return; }
+
+  const execName = fStr(exec,'Executive Name');
+  const orgName  = fStr(exec,'Organization / Partner');
+  const coachName = coach.name || '[Coach]';
+  const coachEmail = coach.email || '';
+
+  const toLine = `To: ${coachName}${coachEmail ? ` — ${coachEmail}` : ''}`;
+  const subjectLine = `Subject: You've Been Selected — ${execName}, ${orgName}`;
+
+  const html = `<p><strong>${esc(toLine)}</strong></p>
+<p><strong>${esc(subjectLine)}</strong></p>
+<p>Hi ${esc(coachName)},</p>
+<p>Great news — ${esc(execName)} has selected you as their coach following the Chemistry Call process. We're thrilled to move forward with you.</p>
+<p>As a next step, our Customer Support team will match you to ${esc(execName)} on the BetterUp platform. Their scheduling contact will then reach out to book your first session.</p>
+<p>Thank you for your time and engagement throughout this process. We look forward to working with you.</p>
+<p>Warm regards,<br>[Your Name]<br>BetterUp</p>`;
+
+  const plain = `${toLine}
+${subjectLine}
+
+Hi ${coachName},
+
+Great news — ${execName} has selected you as their coach following the Chemistry Call process. We're thrilled to move forward with you.
+
+As a next step, our Customer Support team will match you to ${execName} on the BetterUp platform. Their scheduling contact will then reach out to book your first session.
+
+Thank you for your time and engagement throughout this process. We look forward to working with you.
+
+Warm regards,
+[Your Name]
+BetterUp`;
+
+  const ok = await clipboardCopyRich(html, plain);
+  if (!ok) { showToast('Copy failed — please copy manually','error'); return; }
+
+  btn.textContent = '✓ Copied!';
+  btn.disabled = true;
+
+  try {
+    const today = todayISO();
+    const updated = await patchRec('Chemistry Calls', chemId, {
+      'Selected Coach Email Sent': true,
+      'Selected Coach Email Sent Date': today,
+    });
+    updateChemInState(updated);
+    showToast('Selected coach email copied & marked sent ✓','success');
+  } catch(e) {
+    showToast('Email copied but failed to mark sent: '+e.message,'error');
+  }
+  setTimeout(() => renderDetail(), 900);
+}
+
+// Template N — Not-Selected Coach Email (Stage 4)
+async function copyNotSelectedCoachEmail(execId, chemId, slot, btn) {
+  const exec = S.executives.find(e => e.id === execId);
+  const chem = S.chemCallMap[chemId];
+  if (!exec || !chem) return;
+
+  const coach = chemCoaches(chem).find(c => c.num === slot);
+  if (!coach || !coach.id) { showToast('Coach slot is empty','error'); return; }
+
+  const execName = fStr(exec,'Executive Name');
+  const orgName  = fStr(exec,'Organization / Partner');
+  const coachName = coach.name || '[Coach]';
+  const coachEmail = coach.email || '';
+
+  const toLine = `To: ${coachName}${coachEmail ? ` — ${coachEmail}` : ''}`;
+  const subjectLine = `Subject: Chemistry Call Update — ${execName}, ${orgName}`;
+
+  const html = `<p><strong>${esc(toLine)}</strong></p>
+<p><strong>${esc(subjectLine)}</strong></p>
+<p>Hi ${esc(coachName)},</p>
+<p>Thank you so much for taking the time to participate in the Chemistry Call process for ${esc(execName)}. We truly appreciate your engagement.</p>
+<p>After careful consideration, ${esc(execName)} has decided to move forward with another coach. We want you to know your time and preparation were valued, and you have been compensated accordingly.</p>
+<p>We hope to collaborate again in the future.</p>
+<p>Warm regards,<br>[Your Name]<br>BetterUp</p>`;
+
+  const plain = `${toLine}
+${subjectLine}
+
+Hi ${coachName},
+
+Thank you so much for taking the time to participate in the Chemistry Call process for ${execName}. We truly appreciate your engagement.
+
+After careful consideration, ${execName} has decided to move forward with another coach. We want you to know your time and preparation were valued, and you have been compensated accordingly.
+
+We hope to collaborate again in the future.
+
+Warm regards,
+[Your Name]
+BetterUp`;
+
+  const ok = await clipboardCopyRich(html, plain);
+  if (!ok) { showToast('Copy failed — please copy manually','error'); return; }
+
+  btn.textContent = '✓ Copied!';
+  btn.disabled = true;
+
+  try {
+    const today = todayISO();
+    const updated = await patchRec('Chemistry Calls', chemId, {
+      [`Coach ${slot} Not Selected Email Sent`]: true,
+      [`Coach ${slot} Not Selected Email Sent Date`]: today,
+    });
+    updateChemInState(updated);
+    showToast('Not-selected email copied & marked sent ✓','success');
+  } catch(e) {
+    showToast('Email copied but failed to mark sent: '+e.message,'error');
+  }
+  setTimeout(() => renderDetail(), 900);
+}
+
+async function undoPostSelEmail(chemId, kind, slot) {
+  try {
+    const fields = kind === 'selected'
+      ? { 'Selected Coach Email Sent': false, 'Selected Coach Email Sent Date': null }
+      : { [`Coach ${slot} Not Selected Email Sent`]: false, [`Coach ${slot} Not Selected Email Sent Date`]: null };
+    const updated = await patchRec('Chemistry Calls', chemId, fields);
+    updateChemInState(updated);
+    showToast('Email undone','success');
+    renderDetail();
+  } catch(e) { showToast('Error: '+e.message,'error'); }
 }
 
 // Template C — Tripartite Kickoff
