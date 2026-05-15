@@ -321,6 +321,16 @@ const S = {
   // view state
   filter: 'all', search: '',
   selectedExecId: null,
+  // coach picker (inline, in detail header) — mode: 'change' | 'assign' | null
+  coachPicker: { mode: null, loading: false, coaches: null, selectedId: '', busy: false, awaitProgramAssign: false },
+  // post-disconnect amber banner (cleared on next detail navigation or by user)
+  disconnectWarning: false,
+  // create chemistry call inline form
+  createChem: { open: false, loading: false, coaches: null, busy: false,
+                coach1: '', coach2: '', coach3: '', executiveContext: '', internalNotes: '' },
+  // create program inline form — type: 'Tripartite' | 'Qualitative 360' | null
+  createProgram: { type: null, busy: false,
+                   startDate: '', totalSessions: '', sequenceOrder: '', strategicContext: '', internalNotes: '' },
 };
 
 /* ─────────────────────────────────────────
@@ -345,6 +355,16 @@ async function fetchAll(tableName, extraParams) {
 async function patchRec(tableName, id, fields) {
   const r = await fetch(`${BASE_URL}/${encodeURIComponent(tableName)}/${id}`, {
     method: 'PATCH',
+    headers: { Authorization: `Bearer ${API_KEY}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ fields }),
+  });
+  if (!r.ok) { const e = await r.json(); throw new Error(e.error?.message || `HTTP ${r.status}`); }
+  return await r.json();
+}
+
+async function createRec(tableName, fields) {
+  const r = await fetch(`${BASE_URL}/${encodeURIComponent(tableName)}`, {
+    method: 'POST',
     headers: { Authorization: `Bearer ${API_KEY}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({ fields }),
   });
@@ -635,7 +655,18 @@ function execRow(exec) {
 /* ─────────────────────────────────────────
    VIEW 2 — NAVIGATION
 ───────────────────────────────────────── */
+function resetTransientDetailState() {
+  S.coachPicker = { mode: null, loading: false, coaches: null, selectedId: '', busy: false, awaitProgramAssign: false };
+  S.createChem = { open: false, loading: false, coaches: null, busy: false,
+                   coach1: '', coach2: '', coach3: '', executiveContext: '', internalNotes: '' };
+  S.createProgram = { type: null, busy: false,
+                      startDate: '', totalSessions: '', sequenceOrder: '', strategicContext: '', internalNotes: '' };
+  S.disconnectWarning = false;
+  closeConfirmModal();
+}
+
 async function showDetail(execId) {
+  if (S.selectedExecId !== execId) resetTransientDetailState();
   S.selectedExecId = execId;
   document.getElementById('view-list').style.display = 'none';
   const detailEl = document.getElementById('view-detail');
@@ -658,6 +689,7 @@ async function showDetail(execId) {
 }
 
 function showList() {
+  resetTransientDetailState();
   document.getElementById('view-detail').style.display = 'none';
   document.getElementById('view-list').style.display   = 'block';
   renderList();
@@ -685,6 +717,8 @@ function renderDetail() {
   document.getElementById('view-detail').innerHTML = `
     <button class="back-btn" onclick="showList()">← Back to list</button>
 
+    ${renderDisconnectBanner(execId)}
+
     <div class="card">
       <div class="card-body">
         <div class="exec-header-top">
@@ -698,9 +732,7 @@ function renderDetail() {
           <div class="info-item"><label>Email</label>
             <div class="val">${fStr(exec,'Email') ? `<a href="mailto:${esc(fStr(exec,'Email'))}">${esc(fStr(exec,'Email'))}</a>` : '<span class="empty">—</span>'}</div>
           </div>
-          <div class="info-item"><label>Coach</label>
-            <div class="val">${esc(coachName)}${coachEmail ? `<br><a href="mailto:${esc(coachEmail)}" style="font-size:12px">${esc(coachEmail)}</a>` : ''}</div>
-          </div>
+          ${renderCoachCell(exec)}
           <div class="info-item"><label>EA Name</label>
             <div class="val">${esc(fStr(exec,'EA Name')) || '<span class="empty">—</span>'}</div>
           </div>
@@ -711,12 +743,15 @@ function renderDetail() {
             <div class="val">${formatDate(f(exec,'Engagement Start Date'))}</div>
           </div>
         </div>
+        ${renderCoachPickerPanel(exec)}
       </div>
     </div>
 
-    ${hasCC  ? renderChemSection(exec, chem)  : ''}
+    ${chem ? renderChemSection(exec, chem) : renderChemPlaceholder(exec)}
     ${hasT   ? renderTriSection(exec, triProg) : ''}
     ${has360 ? render360Section(exec, s60Prog) : ''}
+    ${renderProgramsReminder(exec, triProg, s60Prog, hasT, has360)}
+    ${renderAddProgramSection(exec, hasT, has360)}
   `;
 }
 
@@ -1367,6 +1402,541 @@ async function saveExecutiveEdit() {
     showToast('Error: '+e.message,'error');
   } finally {
     btn.disabled = false; btn.textContent = 'Save Changes';
+  }
+}
+
+/* ─────────────────────────────────────────
+   COACH CONNECT / DISCONNECT / CHANGE  (Capability 1)
+───────────────────────────────────────── */
+function renderDisconnectBanner(execId) {
+  if (S.disconnectWarning !== execId) return '';
+  return `
+    <div class="callout callout-amber" style="display:flex;align-items:flex-start;gap:12px">
+      <div style="flex:1">
+        <div class="callout-title">Coach has been disconnected</div>
+        <div>Any linked programs will need a coach reassigned before kickoff emails can be sent.</div>
+      </div>
+      <button class="btn btn-secondary btn-sm" onclick="dismissDisconnectWarning()">Dismiss</button>
+    </div>`;
+}
+function dismissDisconnectWarning() {
+  S.disconnectWarning = false;
+  renderDetail();
+}
+
+function renderCoachCell(exec) {
+  const coachIds = fArr(exec,'Coach');
+  const coachRec = coachIds[0] ? S.coachMap[coachIds[0]] : null;
+  const coachName  = coachRec?.fields?.['Coach Name'] || '';
+  const coachEmail = fLu(exec,'Coach Email') || coachRec?.fields?.['Coach Email'] || '';
+  const busy = S.coachPicker.busy;
+  if (!coachRec) {
+    return `
+      <div class="info-item"><label>Coach</label>
+        <div class="val" style="color:#b45309;font-weight:500">No coach assigned</div>
+        <button class="btn btn-secondary btn-sm" style="margin-top:8px"
+                onclick="openCoachPicker('assign')" ${busy ? 'disabled' : ''}>Assign Coach</button>
+      </div>`;
+  }
+  return `
+    <div class="info-item"><label>Coach</label>
+      <div class="val">${esc(coachName)}${coachEmail ? `<br><a href="mailto:${esc(coachEmail)}" style="font-size:12px">${esc(coachEmail)}</a>` : ''}</div>
+      <div style="display:flex;gap:6px;margin-top:8px;flex-wrap:wrap">
+        <button class="btn btn-secondary btn-sm" onclick="openCoachPicker('change')" ${busy ? 'disabled' : ''}>Change Coach</button>
+        <button class="btn btn-sm" style="background:#fef2f2;border:1px solid #fecaca;color:#b91c1c"
+                onclick="openDisconnectConfirm()" ${busy ? 'disabled' : ''}>Disconnect Coach</button>
+      </div>
+    </div>`;
+}
+
+function renderCoachPickerPanel(exec) {
+  const cp = S.coachPicker;
+  if (!cp.mode) return '';
+  if (cp.awaitProgramAssign) {
+    return `
+      <div class="callout callout-amber" style="margin-top:14px">
+        <div class="callout-title">Also assign this coach to ${esc(fStr(exec,'Executive Name'))}'s existing programs?</div>
+        <div style="margin-top:4px">Programs without a coach will inherit this assignment.</div>
+        <div style="display:flex;gap:8px;margin-top:10px">
+          <button class="btn btn-primary btn-sm" onclick="answerProgramAssign(true)"  ${cp.busy ? 'disabled' : ''}>${cp.busy ? 'Saving…' : 'Yes, assign to all'}</button>
+          <button class="btn btn-secondary btn-sm" onclick="answerProgramAssign(false)" ${cp.busy ? 'disabled' : ''}>No, executive only</button>
+        </div>
+      </div>`;
+  }
+  const verb = cp.mode === 'change' ? 'Change coach' : 'Assign coach';
+  const submitLabel = cp.mode === 'change' ? 'Save change' : 'Assign';
+  const opts = cp.coaches || [];
+  return `
+    <div class="callout callout-gray" style="margin-top:14px">
+      <div class="callout-title">${verb}</div>
+      <div class="field-group" style="margin:10px 0 0">
+        ${cp.loading
+          ? '<div class="section-loading"><div class="spinner spinner-sm"></div>Loading coaches…</div>'
+          : `<select id="coach-picker-select" ${cp.busy ? 'disabled' : ''}>
+               <option value="">— Select a coach —</option>
+               ${opts.map(c => `<option value="${esc(c.id)}">${esc(c.name)} — ${esc(c.email)}</option>`).join('')}
+             </select>`}
+      </div>
+      <div style="display:flex;gap:8px;margin-top:12px">
+        <button class="btn btn-primary btn-sm" onclick="confirmCoachPicker()" ${cp.busy || cp.loading ? 'disabled' : ''}>${cp.busy ? 'Saving…' : submitLabel}</button>
+        <button class="btn btn-secondary btn-sm" onclick="cancelCoachPicker()" ${cp.busy ? 'disabled' : ''}>Cancel</button>
+      </div>
+    </div>`;
+}
+
+async function fetchCoachesFresh() {
+  const recs = await fetchAll('Coaches');
+  return recs.map(r => ({
+    id: r.id,
+    name: r.fields?.['Coach Name'] || '(unnamed)',
+    email: r.fields?.['Coach Email'] || '',
+  })).sort((a,b) => a.name.localeCompare(b.name));
+}
+
+async function openCoachPicker(mode) {
+  S.coachPicker = { mode, loading: true, coaches: null, selectedId: '', busy: false, awaitProgramAssign: false };
+  renderDetail();
+  try {
+    const coaches = await fetchCoachesFresh();
+    S.coachPicker.coaches = coaches;
+    S.coachPicker.loading = false;
+    renderDetail();
+  } catch (e) {
+    showToast('Error loading coaches: ' + e.message, 'error');
+    S.coachPicker = { mode: null, loading: false, coaches: null, selectedId: '', busy: false, awaitProgramAssign: false };
+    renderDetail();
+  }
+}
+
+function cancelCoachPicker() {
+  S.coachPicker = { mode: null, loading: false, coaches: null, selectedId: '', busy: false, awaitProgramAssign: false };
+  renderDetail();
+}
+
+async function confirmCoachPicker() {
+  const sel = document.getElementById('coach-picker-select');
+  const coachId = sel?.value || '';
+  if (!coachId) { showToast('Please select a coach', 'error'); return; }
+  S.coachPicker.selectedId = coachId;
+  S.coachPicker.busy = true;
+  renderDetail();
+  try {
+    showToast('Saving…', 'info');
+    const updated = await patchRec('Executives', S.selectedExecId, { 'Coach': [coachId] });
+    updateExecInState(updated);
+    showToast(S.coachPicker.mode === 'change' ? 'Coach updated' : 'Coach assigned', 'success');
+    // Capability 1 spec: if assign mode and exec has linked Programs missing a coach, offer cascade
+    const progsNoCoach = (S.execPrograms[S.selectedExecId] || []).filter(p => fArr(p, 'Coach').length === 0);
+    if (S.coachPicker.mode === 'assign' && progsNoCoach.length > 0) {
+      S.coachPicker.busy = false;
+      S.coachPicker.awaitProgramAssign = true;
+      renderDetail();
+    } else {
+      cancelCoachPicker();
+    }
+  } catch (e) {
+    showToast('Error: ' + e.message, 'error');
+    S.coachPicker.busy = false;
+    renderDetail();
+  }
+}
+
+async function answerProgramAssign(yes) {
+  const coachId = S.coachPicker.selectedId;
+  if (!yes || !coachId) { cancelCoachPicker(); return; }
+  S.coachPicker.busy = true;
+  renderDetail();
+  try {
+    const progsNoCoach = (S.execPrograms[S.selectedExecId] || []).filter(p => fArr(p, 'Coach').length === 0);
+    showToast('Updating programs…', 'info');
+    for (const p of progsNoCoach) {
+      const updated = await patchRec('Programs', p.id, { 'Coach': [coachId] });
+      updateProgInState(updated);
+    }
+    showToast(`Coach assigned to ${progsNoCoach.length} program${progsNoCoach.length===1?'':'s'}`, 'success');
+    cancelCoachPicker();
+  } catch (e) {
+    showToast('Error: ' + e.message, 'error');
+    S.coachPicker.busy = false;
+    renderDetail();
+  }
+}
+
+function openDisconnectConfirm() {
+  const exec = S.executives.find(e => e.id === S.selectedExecId);
+  if (!exec) return;
+  const coachIds = fArr(exec, 'Coach');
+  const coachRec = coachIds[0] ? S.coachMap[coachIds[0]] : null;
+  const coachName = coachRec?.fields?.['Coach Name'] || 'this coach';
+  const execName = fStr(exec, 'Executive Name') || 'this executive';
+  showConfirmModal({
+    title: 'Disconnect coach',
+    message: `Are you sure you want to disconnect ${esc(coachName)} from ${esc(execName)}? This will also remove them from any associated program records.`,
+    confirmLabel: 'Disconnect',
+    danger: true,
+    onConfirm: confirmDisconnectCoach,
+  });
+}
+
+async function confirmDisconnectCoach() {
+  const execId = S.selectedExecId;
+  const setBusy = (b) => { S.coachPicker.busy = b; };
+  setBusy(true);
+  // Find linked, non-completed programs to cascade-clear
+  const cascadeProgs = (S.execPrograms[execId] || []).filter(p => {
+    if (fArr(p, 'Coach').length === 0) return false;
+    return f(p, 'Status') !== 'Completed';
+  });
+  try {
+    showToast('Disconnecting…', 'info');
+    const updatedExec = await patchRec('Executives', execId, { 'Coach': [] });
+    updateExecInState(updatedExec);
+    for (const p of cascadeProgs) {
+      const updated = await patchRec('Programs', p.id, { 'Coach': [] });
+      updateProgInState(updated);
+    }
+    S.disconnectWarning = execId;
+    showToast(cascadeProgs.length
+      ? `Coach disconnected; ${cascadeProgs.length} program${cascadeProgs.length===1?'':'s'} cleared`
+      : 'Coach disconnected', 'success');
+    closeConfirmModal();
+    setBusy(false);
+    renderDetail();
+  } catch (e) {
+    showToast('Error: ' + e.message, 'error');
+    setBusy(false);
+    closeConfirmModal();
+    renderDetail();
+  }
+}
+
+/* Generic confirm modal (DOM-injected so it doesn't depend on static markup) */
+function showConfirmModal({ title, message, confirmLabel = 'Confirm', danger = false, onConfirm }) {
+  closeConfirmModal();
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.id = 'confirm-modal-overlay';
+  overlay.style.display = 'flex';
+  overlay.innerHTML = `
+    <div class="modal" role="dialog" aria-modal="true">
+      <div class="modal-header">
+        <div class="modal-title">${esc(title)}</div>
+        <button class="modal-close-btn" onclick="closeConfirmModal()">×</button>
+      </div>
+      <div class="modal-body"><div style="font-size:14px;line-height:1.5">${message}</div></div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" onclick="closeConfirmModal()">Cancel</button>
+        <button class="btn" id="confirm-modal-ok"
+                style="${danger ? 'background:#dc2626;color:#fff;border:1px solid #b91c1c' : 'background:var(--accent);color:#fff'}">
+          ${esc(confirmLabel)}
+        </button>
+      </div>
+    </div>`;
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) closeConfirmModal(); });
+  document.body.appendChild(overlay);
+  document.getElementById('confirm-modal-ok').addEventListener('click', async () => {
+    document.getElementById('confirm-modal-ok').disabled = true;
+    document.getElementById('confirm-modal-ok').textContent = 'Working…';
+    try { await onConfirm(); } catch (e) { showToast('Error: ' + e.message, 'error'); closeConfirmModal(); }
+  });
+}
+function closeConfirmModal() {
+  const el = document.getElementById('confirm-modal-overlay');
+  if (el) el.remove();
+}
+
+/* ─────────────────────────────────────────
+   CREATE CHEMISTRY CALL  (Capability 2)
+───────────────────────────────────────── */
+function renderChemPlaceholder(exec) {
+  const cc = S.createChem;
+  if (!cc.open) {
+    return `
+      <div class="card">
+        <div class="card-header"><div class="card-title">Chemistry Calls</div></div>
+        <div class="card-body">
+          <div class="info-box" style="margin-bottom:12px">No Chemistry Call record exists for this executive yet.</div>
+          <button class="btn btn-primary" onclick="openCreateChemForm()">Create Chemistry Call Record</button>
+        </div>
+      </div>`;
+  }
+  const opts = cc.coaches || [];
+  const coachOpts = (selectedId) => `
+    <option value="">— None (assign later) —</option>
+    ${opts.map(c => `<option value="${esc(c.id)}" ${selectedId===c.id?'selected':''}>${esc(c.name)} — ${esc(c.email)}</option>`).join('')}`;
+  const anyCoachBlank = !cc.coach1 || !cc.coach2 || !cc.coach3;
+  return `
+    <div class="card">
+      <div class="card-header"><div class="card-title">Create Chemistry Call Record</div></div>
+      <div class="card-body">
+        <div class="field-group">
+          <label>Executive</label>
+          <div class="info-box">${esc(fStr(exec,'Executive Name'))}</div>
+        </div>
+        ${cc.loading ? '<div class="section-loading"><div class="spinner spinner-sm"></div>Loading coaches…</div>' : `
+          <div class="three-col" style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px">
+            <div class="field-group" style="margin-bottom:0">
+              <label>Coach 1</label>
+              <select id="cc-coach1" ${cc.busy ? 'disabled' : ''}>${coachOpts(cc.coach1)}</select>
+            </div>
+            <div class="field-group" style="margin-bottom:0">
+              <label>Coach 2</label>
+              <select id="cc-coach2" ${cc.busy ? 'disabled' : ''}>${coachOpts(cc.coach2)}</select>
+            </div>
+            <div class="field-group" style="margin-bottom:0">
+              <label>Coach 3</label>
+              <select id="cc-coach3" ${cc.busy ? 'disabled' : ''}>${coachOpts(cc.coach3)}</select>
+            </div>
+          </div>
+          <div class="field-group" style="margin-top:14px">
+            <label>Executive Context</label>
+            <textarea id="cc-exec-context" rows="3"
+                      placeholder="Any context about this executive that would help coaches prepare..."
+                      ${cc.busy ? 'disabled' : ''}>${esc(cc.executiveContext)}</textarea>
+          </div>
+          <div class="field-group">
+            <label>Internal Notes</label>
+            <textarea id="cc-internal-notes" rows="3" ${cc.busy ? 'disabled' : ''}>${esc(cc.internalNotes)}</textarea>
+          </div>
+          ${anyCoachBlank
+            ? '<div class="callout callout-amber" style="margin-top:4px">You can assign coaches now or link them directly in Airtable later. Booking links will not generate until all three coaches are assigned.</div>'
+            : ''}
+          <div style="display:flex;gap:8px;margin-top:12px">
+            <button class="btn btn-primary" onclick="submitCreateChem()" ${cc.busy ? 'disabled' : ''}>${cc.busy ? 'Creating…' : 'Create record'}</button>
+            <button class="btn btn-secondary" onclick="cancelCreateChem()" ${cc.busy ? 'disabled' : ''}>Cancel</button>
+          </div>
+        `}
+      </div>
+    </div>`;
+}
+
+// Capture form field values so they survive intermediate re-renders
+function captureCreateChemFields() {
+  const g = (id) => document.getElementById(id);
+  if (g('cc-coach1')) S.createChem.coach1 = g('cc-coach1').value || '';
+  if (g('cc-coach2')) S.createChem.coach2 = g('cc-coach2').value || '';
+  if (g('cc-coach3')) S.createChem.coach3 = g('cc-coach3').value || '';
+  if (g('cc-exec-context'))   S.createChem.executiveContext = g('cc-exec-context').value || '';
+  if (g('cc-internal-notes')) S.createChem.internalNotes    = g('cc-internal-notes').value || '';
+}
+
+async function openCreateChemForm() {
+  S.createChem = { open: true, loading: true, coaches: null, busy: false,
+                   coach1: '', coach2: '', coach3: '', executiveContext: '', internalNotes: '' };
+  renderDetail();
+  try {
+    const coaches = await fetchCoachesFresh();
+    S.createChem.coaches = coaches;
+    S.createChem.loading = false;
+    renderDetail();
+  } catch (e) {
+    showToast('Error loading coaches: ' + e.message, 'error');
+    S.createChem.open = false;
+    renderDetail();
+  }
+}
+function cancelCreateChem() {
+  S.createChem = { open: false, loading: false, coaches: null, busy: false,
+                   coach1: '', coach2: '', coach3: '', executiveContext: '', internalNotes: '' };
+  renderDetail();
+}
+async function submitCreateChem() {
+  captureCreateChemFields();
+  const execId = S.selectedExecId;
+  const cc = S.createChem;
+  const fields = {
+    'Executive': [execId],
+    'Status': 'Not Started',
+  };
+  if (cc.coach1) fields['Coach 1'] = [cc.coach1];
+  if (cc.coach2) fields['Coach 2'] = [cc.coach2];
+  if (cc.coach3) fields['Coach 3'] = [cc.coach3];
+  if (cc.executiveContext.trim()) fields['Executive Context'] = cc.executiveContext.trim();
+  if (cc.internalNotes.trim())    fields['Internal Notes']    = cc.internalNotes.trim();
+  S.createChem.busy = true;
+  renderDetail();
+  try {
+    showToast('Creating record…', 'info');
+    const newChem = await createRec('Chemistry Calls', fields);
+    updateChemInState(newChem);
+    const updatedExec = await patchRec('Executives', execId, { 'Has Chemistry Calls': true });
+    updateExecInState(updatedExec);
+    showToast('Chemistry Call record created.', 'success');
+    cancelCreateChem();
+  } catch (e) {
+    showToast('Error: ' + e.message, 'error');
+    S.createChem.busy = false;
+    renderDetail();
+  }
+}
+
+/* ─────────────────────────────────────────
+   CREATE TRIPARTITE / 360 PROGRAM  (Capability 3)
+───────────────────────────────────────── */
+function renderProgramsReminder(exec, triProg, s60Prog, hasT, has360) {
+  if (!hasT || !has360 || !triProg || !s60Prog) return '';
+  const triSeq = f(triProg, 'Sequence Order');
+  const s60Seq = f(s60Prog, 'Sequence Order');
+  if (triSeq && s60Seq) return '';
+  return `
+    <div class="callout callout-amber">
+      <div class="callout-title">Sequence Order missing</div>
+      <div>This executive has both programs. Remember to set Sequence Order on both records so the coaching flow is clear.</div>
+    </div>`;
+}
+
+function renderAddProgramSection(exec, hasT, has360) {
+  if (hasT && has360) return '';
+  const cp = S.createProgram;
+  const coachIds = fArr(exec, 'Coach');
+  const hasCoach = coachIds.length > 0;
+  const coachRec = hasCoach ? S.coachMap[coachIds[0]] : null;
+  const coachName = coachRec?.fields?.['Coach Name'] || '';
+
+  if (cp.type) {
+    return renderCreateProgramForm(exec, cp, coachName);
+  }
+  const buttons = [];
+  if (!hasT)   buttons.push({ label: 'Create Tripartite Program', type: 'Tripartite' });
+  if (!has360) buttons.push({ label: 'Create 360 Program',         type: 'Qualitative 360' });
+  return `
+    <div class="card">
+      <div class="card-header"><div class="card-title">Add Program</div></div>
+      <div class="card-body">
+        ${!hasCoach
+          ? `<div class="callout callout-amber">A coach must be assigned to this executive before a program can be created. Use the Assign Coach option above first.</div>`
+          : ''}
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          ${buttons.map(b => `
+            <button class="btn btn-primary" ${hasCoach ? '' : 'disabled'}
+                    onclick="openCreateProgramForm('${esc(b.type)}')">${esc(b.label)}</button>
+          `).join('')}
+        </div>
+      </div>
+    </div>`;
+}
+
+function renderCreateProgramForm(exec, cp, coachName) {
+  const typeLabel = cp.type === 'Tripartite' ? 'Tripartite' : '360';
+  const triExists = (S.execPrograms[exec.id] || []).some(p => f(p,'Program Type') === 'Tripartite');
+  const s60Exists = (S.execPrograms[exec.id] || []).some(p => f(p,'Program Type') === 'Qualitative 360');
+  const showSeq = triExists || s60Exists;  // either currently exists, so the new one is part of a pair
+  return `
+    <div class="card">
+      <div class="card-header"><div class="card-title">Create ${esc(typeLabel)} Program</div></div>
+      <div class="card-body">
+        <div class="two-col">
+          <div class="field-group">
+            <label>Program Type</label>
+            <div class="info-box">${esc(typeLabel === '360' ? 'Qualitative 360' : 'Tripartite')}</div>
+          </div>
+          <div class="field-group">
+            <label>Executive</label>
+            <div class="info-box">${esc(fStr(exec,'Executive Name'))}</div>
+          </div>
+        </div>
+        <div class="field-group">
+          <label>Coach (inherited from executive)</label>
+          <div class="info-box">${esc(coachName || '—')}</div>
+        </div>
+        <div class="two-col">
+          <div class="field-group">
+            <label>Start Date</label>
+            <input type="date" id="cp-start-date" value="${esc(cp.startDate)}" placeholder="${todayISO()}" ${cp.busy ? 'disabled' : ''}>
+          </div>
+          <div class="field-group">
+            <label>Total Sessions Expected</label>
+            <input type="number" min="0" id="cp-total-sessions" value="${esc(cp.totalSessions)}"
+                   placeholder="e.g. 1 for Tripartite, 6 for 360" ${cp.busy ? 'disabled' : ''}>
+          </div>
+        </div>
+        ${showSeq ? `
+          <div class="field-group">
+            <label>Sequence Order</label>
+            <select id="cp-sequence" ${cp.busy ? 'disabled' : ''}>
+              <option value=""        ${cp.sequenceOrder===''?'selected':''}>— Optional —</option>
+              <option value="First"   ${cp.sequenceOrder==='First'?'selected':''}>First</option>
+              <option value="Second"  ${cp.sequenceOrder==='Second'?'selected':''}>Second</option>
+            </select>
+          </div>
+        ` : ''}
+        <div class="field-group">
+          <label>Strategic Context</label>
+          <textarea id="cp-strategic-context" rows="3"
+                    placeholder="Organizational priorities or context to inform the coaching work..."
+                    ${cp.busy ? 'disabled' : ''}>${esc(cp.strategicContext)}</textarea>
+        </div>
+        <div class="field-group">
+          <label>Internal Notes</label>
+          <textarea id="cp-internal-notes" rows="3" ${cp.busy ? 'disabled' : ''}>${esc(cp.internalNotes)}</textarea>
+        </div>
+        <div style="display:flex;gap:8px;margin-top:6px">
+          <button class="btn btn-primary" onclick="submitCreateProgram()" ${cp.busy ? 'disabled' : ''}>${cp.busy ? 'Creating…' : `Create ${esc(typeLabel)} program`}</button>
+          <button class="btn btn-secondary" onclick="cancelCreateProgram()" ${cp.busy ? 'disabled' : ''}>Cancel</button>
+        </div>
+      </div>
+    </div>`;
+}
+
+function captureCreateProgramFields() {
+  const g = (id) => document.getElementById(id);
+  if (g('cp-start-date'))         S.createProgram.startDate        = g('cp-start-date').value || '';
+  if (g('cp-total-sessions'))     S.createProgram.totalSessions    = g('cp-total-sessions').value || '';
+  if (g('cp-sequence'))           S.createProgram.sequenceOrder    = g('cp-sequence').value || '';
+  if (g('cp-strategic-context'))  S.createProgram.strategicContext = g('cp-strategic-context').value || '';
+  if (g('cp-internal-notes'))     S.createProgram.internalNotes    = g('cp-internal-notes').value || '';
+}
+function openCreateProgramForm(programType) {
+  const exec = S.executives.find(e => e.id === S.selectedExecId);
+  if (!exec) return;
+  if (fArr(exec, 'Coach').length === 0) {
+    showToast('Assign a coach to this executive first', 'error');
+    return;
+  }
+  S.createProgram = { type: programType, busy: false,
+                      startDate: '', totalSessions: '', sequenceOrder: '', strategicContext: '', internalNotes: '' };
+  renderDetail();
+}
+function cancelCreateProgram() {
+  S.createProgram = { type: null, busy: false,
+                      startDate: '', totalSessions: '', sequenceOrder: '', strategicContext: '', internalNotes: '' };
+  renderDetail();
+}
+async function submitCreateProgram() {
+  captureCreateProgramFields();
+  const execId = S.selectedExecId;
+  const exec = S.executives.find(e => e.id === execId);
+  if (!exec) return;
+  const coachIds = fArr(exec, 'Coach');
+  if (coachIds.length === 0) { showToast('Executive has no coach assigned', 'error'); return; }
+  const cp = S.createProgram;
+  const fields = {
+    'Program Type': cp.type,
+    'Status': 'Not Started',
+    'Executive': [execId],
+    'Coach': [coachIds[0]],
+  };
+  if (cp.startDate)              fields['Start Date'] = cp.startDate;
+  if (cp.totalSessions !== '')   fields['Total Sessions Expected'] = Number(cp.totalSessions);
+  if (cp.sequenceOrder)          fields['Sequence Order'] = cp.sequenceOrder;
+  if (cp.strategicContext.trim())fields['Strategic Context'] = cp.strategicContext.trim();
+  if (cp.internalNotes.trim())   fields['Internal Notes']    = cp.internalNotes.trim();
+
+  S.createProgram.busy = true;
+  renderDetail();
+  try {
+    showToast('Creating program…', 'info');
+    const newProg = await createRec('Programs', fields);
+    updateProgInState(newProg);
+    const flagField = cp.type === 'Tripartite' ? 'Has Tripartite' : 'Has 360';
+    const updatedExec = await patchRec('Executives', execId, { [flagField]: true });
+    updateExecInState(updatedExec);
+    showToast(cp.type === 'Tripartite' ? 'Tripartite program created.' : '360 program created.', 'success');
+    cancelCreateProgram();
+  } catch (e) {
+    showToast('Error: ' + e.message, 'error');
+    S.createProgram.busy = false;
+    renderDetail();
   }
 }
 
